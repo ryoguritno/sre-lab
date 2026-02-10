@@ -1,0 +1,431 @@
+# Taskfile.yml — SRE Lab Infrastructure
+# https://taskfile.dev
+#
+# One-command operations for local and cloud deployments
+# Usage: task <command>
+# Run `task --list` to see all available commands
+
+version: '3'
+
+vars:
+  CLUSTER_NAME: sre-lab
+  TALOS_VERSION: "v1.6.4"
+  K8S_VERSION: "1.29.0"
+  SECRETS_DIR: .secrets
+  KUBECONFIG: "{{.SECRETS_DIR}}/kubeconfig"
+  TALOSCONFIG: "{{.SECRETS_DIR}}/talosconfig"
+
+env:
+  KUBECONFIG: "{{.KUBECONFIG}}"
+  TALOSCONFIG: "{{.TALOSCONFIG}}"
+
+tasks:
+  #============================================================================
+  # DEFAULT / HELP
+  #============================================================================
+  default:
+    desc: "Show available commands"
+    cmds:
+      - task --list
+
+  #============================================================================
+  # PREREQUISITES CHECK
+  #============================================================================
+  prereqs:
+    desc: "Check all prerequisites are installed"
+    cmds:
+      - |
+        echo "Checking prerequisites..."
+        
+        check_cmd() {
+          if command -v $1 &> /dev/null; then
+            echo "✅ $1 found: $($1 --version 2>&1 | head -1)"
+          else
+            echo "❌ $1 NOT FOUND - please install"
+            exit 1
+          fi
+        }
+        
+        check_cmd vagrant
+        check_cmd VBoxManage
+        check_cmd talosctl
+        check_cmd kubectl
+        check_cmd helm
+        check_cmd terraform
+        
+        echo ""
+        echo "Optional tools:"
+        command -v cilium &> /dev/null && echo "✅ cilium CLI" || echo "⚪ cilium CLI (optional)"
+        command -v hubble &> /dev/null && echo "✅ hubble CLI" || echo "⚪ hubble CLI (optional)"
+        command -v k9s &> /dev/null && echo "✅ k9s" || echo "⚪ k9s (optional)"
+        
+        echo ""
+        echo "✅ All required prerequisites installed"
+
+  #============================================================================
+  # LOCAL ENVIRONMENT (VAGRANT + VIRTUALBOX)
+  #============================================================================
+  local:up:
+    desc: "🚀 Start complete local SRE Lab environment"
+    cmds:
+      - task: local:infra
+      - task: local:bootstrap
+      - task: local:cni
+      - task: local:observability
+      - task: local:info
+    
+  local:down:
+    desc: "🗑️  Destroy local environment completely"
+    dir: infrastructure/vagrant
+    cmds:
+      - vagrant destroy -f
+      - rm -rf {{.SECRETS_DIR}}/*
+      - echo "✅ Local environment destroyed"
+
+  local:infra:
+    desc: "Provision Vagrant VMs with Talos Linux"
+    dir: infrastructure/vagrant
+    cmds:
+      - mkdir -p {{.SECRETS_DIR}}
+      - vagrant up
+      - task: local:gen-config
+      - task: local:apply-config
+    status:
+      - vagrant status | grep -q "running"
+
+  local:gen-config:
+    desc: "Generate Talos machine configurations"
+    cmds:
+      - |
+        echo "Generating Talos configs..."
+        talosctl gen config {{.CLUSTER_NAME}} https://192.168.56.10:6443 \
+          --output-dir {{.SECRETS_DIR}} \
+          --with-docs=false \
+          --with-examples=false \
+          --kubernetes-version {{.K8S_VERSION}} \
+          --install-disk /dev/sda \
+          --config-patch @infrastructure/talos/patches/cilium.yaml \
+          --config-patch @infrastructure/talos/patches/metrics.yaml
+        echo "✅ Talos configs generated"
+
+  local:apply-config:
+    desc: "Apply Talos configs to nodes"
+    cmds:
+      - |
+        echo "Applying configs to control plane nodes..."
+        for ip in 192.168.56.10 192.168.56.11 192.168.56.12; do
+          echo "Configuring $ip..."
+          talosctl apply-config --insecure --nodes $ip \
+            --file {{.SECRETS_DIR}}/controlplane.yaml || true
+        done
+        
+        echo "Applying configs to worker nodes..."
+        for ip in 192.168.56.20 192.168.56.21; do
+          echo "Configuring $ip..."
+          talosctl apply-config --insecure --nodes $ip \
+            --file {{.SECRETS_DIR}}/worker.yaml || true
+        done
+        
+        echo "✅ Configs applied"
+
+  local:bootstrap:
+    desc: "Bootstrap Talos cluster"
+    cmds:
+      - |
+        echo "Configuring talosctl endpoint..."
+        talosctl config endpoint 192.168.56.10
+        talosctl config node 192.168.56.10
+        
+        echo "Waiting for Talos API..."
+        sleep 30
+        
+        echo "Bootstrapping cluster..."
+        talosctl bootstrap --nodes 192.168.56.10
+        
+        echo "Waiting for bootstrap..."
+        sleep 60
+        
+        echo "Fetching kubeconfig..."
+        talosctl kubeconfig {{.SECRETS_DIR}}/kubeconfig --force
+        
+        echo "✅ Cluster bootstrapped"
+        kubectl get nodes
+
+  local:cni:
+    desc: "Deploy Cilium CNI"
+    cmds:
+      - |
+        echo "Adding Cilium Helm repo..."
+        helm repo add cilium https://helm.cilium.io/ --force-update
+        
+        echo "Installing Cilium..."
+        helm upgrade --install cilium cilium/cilium \
+          --namespace kube-system \
+          --values kubernetes/infrastructure/cilium/values.yaml \
+          --values kubernetes/infrastructure/cilium/values-local.yaml \
+          --wait --timeout 5m
+        
+        echo "Waiting for nodes to be Ready..."
+        kubectl wait --for=condition=Ready nodes --all --timeout=300s
+        
+        echo "✅ Cilium deployed, all nodes Ready"
+
+  local:observability:
+    desc: "Deploy full observability stack"
+    cmds:
+      - task: deploy:prometheus
+      - task: deploy:loki
+      - echo "✅ Observability stack deployed"
+
+  local:status:
+    desc: "Check local cluster status"
+    cmds:
+      - |
+        echo "=== Talos Status ==="
+        talosctl health --nodes 192.168.56.10 || true
+        
+        echo ""
+        echo "=== Kubernetes Nodes ==="
+        kubectl get nodes -o wide
+        
+        echo ""
+        echo "=== Cilium Status ==="
+        cilium status || kubectl get pods -n kube-system -l k8s-app=cilium
+        
+        echo ""
+        echo "=== Observability Pods ==="
+        kubectl get pods -n monitoring
+        kubectl get pods -n logging 2>/dev/null || true
+
+  local:info:
+    desc: "Show access information for local cluster"
+    cmds:
+      - |
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║                    SRE LAB - LOCAL ACCESS                    ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║                                                              ║"
+        echo "║  Kubernetes API:  https://192.168.56.10:6443                 ║"
+        echo "║  Talos API:       https://192.168.56.10:50000                ║"
+        echo "║                                                              ║"
+        echo "║  Grafana:         http://localhost:3000 (port-forward)       ║"
+        echo "║                   Or NodePort: http://192.168.56.20:30300    ║"
+        echo "║                   User: admin / Password: (see secret)       ║"
+        echo "║                                                              ║"
+        echo "║  Prometheus:      http://localhost:9090 (port-forward)       ║"
+        echo "║  Alertmanager:    http://localhost:9093 (port-forward)       ║"
+        echo "║  Hubble UI:       http://localhost:12000 (port-forward)      ║"
+        echo "║                                                              ║"
+        echo "║  Quick Commands:                                             ║"
+        echo "║    task pf:grafana     - Port-forward Grafana               ║"
+        echo "║    task pf:prometheus  - Port-forward Prometheus            ║"
+        echo "║    task pf:hubble      - Port-forward Hubble UI             ║"
+        echo "║                                                              ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+
+  #============================================================================
+  # CLOUD DEPLOYMENT
+  #============================================================================
+  cloud:plan:
+    desc: "Plan cloud infrastructure"
+    dir: "infrastructure/terraform/environments/{{.CLOUD}}-{{.ENV}}"
+    cmds:
+      - terraform init -upgrade
+      - terraform plan -out=tfplan
+    requires:
+      vars: [CLOUD, ENV]
+
+  cloud:apply:
+    desc: "Apply cloud infrastructure"
+    dir: "infrastructure/terraform/environments/{{.CLOUD}}-{{.ENV}}"
+    cmds:
+      - terraform apply tfplan
+      - terraform output -raw talosconfig > {{.SECRETS_DIR}}/talosconfig
+      - terraform output -raw kubeconfig > {{.SECRETS_DIR}}/kubeconfig
+      - echo "✅ Cloud infrastructure deployed"
+    requires:
+      vars: [CLOUD, ENV]
+
+  cloud:destroy:
+    desc: "Destroy cloud infrastructure"
+    dir: "infrastructure/terraform/environments/{{.CLOUD}}-{{.ENV}}"
+    cmds:
+      - terraform destroy
+    requires:
+      vars: [CLOUD, ENV]
+    prompt: "⚠️  This will DESTROY all cloud resources. Continue?"
+
+  cloud:bootstrap:
+    desc: "Bootstrap K8s components on cloud cluster"
+    cmds:
+      - task: local:cni
+      - task: local:observability
+      - echo "✅ Cloud cluster fully configured"
+
+  #============================================================================
+  # KUBERNETES DEPLOYMENTS
+  #============================================================================
+  deploy:prometheus:
+    desc: "Deploy Prometheus stack"
+    cmds:
+      - kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+      - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+      - |
+        helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+          --namespace monitoring \
+          --values kubernetes/observability/prometheus-stack/values.yaml \
+          --values kubernetes/observability/prometheus-stack/values-{{.TARGET | default "local"}}.yaml \
+          --wait --timeout 10m
+      - echo "✅ Prometheus stack deployed"
+
+  deploy:loki:
+    desc: "Deploy Loki logging stack"
+    cmds:
+      - kubectl create namespace logging --dry-run=client -o yaml | kubectl apply -f -
+      - helm repo add grafana https://grafana.github.io/helm-charts --force-update
+      - |
+        helm upgrade --install loki grafana/loki-stack \
+          --namespace logging \
+          --values kubernetes/observability/loki-stack/values.yaml \
+          --values kubernetes/observability/loki-stack/values-{{.TARGET | default "local"}}.yaml \
+          --wait --timeout 5m
+      - kubectl apply -f kubernetes/observability/loki-stack/grafana-datasource.yaml
+      - echo "✅ Loki stack deployed"
+
+  deploy:hubble-ui:
+    desc: "Enable Hubble UI (if not via Helm)"
+    cmds:
+      - cilium hubble enable --ui
+      - echo "✅ Hubble UI enabled"
+
+  #============================================================================
+  # PORT FORWARDS
+  #============================================================================
+  pf:grafana:
+    desc: "Port-forward Grafana (localhost:3000)"
+    cmds:
+      - kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
+
+  pf:prometheus:
+    desc: "Port-forward Prometheus (localhost:9090)"
+    cmds:
+      - kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090
+
+  pf:alertmanager:
+    desc: "Port-forward Alertmanager (localhost:9093)"
+    cmds:
+      - kubectl port-forward -n monitoring svc/kube-prometheus-stack-alertmanager 9093:9093
+
+  pf:hubble:
+    desc: "Port-forward Hubble UI (localhost:12000)"
+    cmds:
+      - kubectl port-forward -n kube-system svc/hubble-ui 12000:80
+
+  pf:loki:
+    desc: "Port-forward Loki (localhost:3100)"
+    cmds:
+      - kubectl port-forward -n logging svc/loki 3100:3100
+
+  #============================================================================
+  # VALIDATION & TESTING
+  #============================================================================
+  validate:
+    desc: "Run all validation checks"
+    cmds:
+      - task: validate:talos
+      - task: validate:k8s
+      - task: validate:cilium
+      - task: validate:observability
+      - echo "✅ All validations passed"
+
+  validate:talos:
+    desc: "Validate Talos cluster health"
+    cmds:
+      - talosctl health
+
+  validate:k8s:
+    desc: "Validate Kubernetes"
+    cmds:
+      - kubectl cluster-info
+      - kubectl get nodes
+      - kubectl get pods -A | grep -v Running | grep -v Completed | head -20 || true
+
+  validate:cilium:
+    desc: "Validate Cilium"
+    cmds:
+      - cilium status
+      - cilium connectivity test --single-node || echo "Run full test with: cilium connectivity test"
+
+  validate:observability:
+    desc: "Validate observability stack"
+    cmds:
+      - |
+        echo "Checking Prometheus..."
+        kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus
+        
+        echo "Checking Grafana..."
+        kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana
+        
+        echo "Checking Loki..."
+        kubectl get pods -n logging -l app=loki 2>/dev/null || echo "Loki not deployed"
+        
+        echo "Checking Promtail..."
+        kubectl get pods -n logging -l app=promtail 2>/dev/null || echo "Promtail not deployed"
+
+  #============================================================================
+  # UTILITIES
+  #============================================================================
+  shell:
+    desc: "Open k9s terminal UI"
+    cmds:
+      - k9s
+
+  logs:talos:
+    desc: "Stream Talos logs from control plane"
+    cmds:
+      - talosctl logs --nodes 192.168.56.10 -f
+
+  logs:cilium:
+    desc: "Stream Cilium agent logs"
+    cmds:
+      - kubectl logs -n kube-system -l k8s-app=cilium -f --max-log-requests=10
+
+  get:grafana-password:
+    desc: "Get Grafana admin password"
+    cmds:
+      - |
+        kubectl get secret -n monitoring kube-prometheus-stack-grafana \
+          -o jsonpath="{.data.admin-password}" | base64 -d
+        echo ""
+
+  clean:
+    desc: "Clean temporary files"
+    cmds:
+      - find . -name "*.tfplan" -delete
+      - find . -name ".terraform.lock.hcl" -delete
+      - find . -type d -name ".terraform" -exec rm -rf {} + 2>/dev/null || true
+      - echo "🧹 Cleaned temporary files"
+
+  #============================================================================
+  # DEVELOPMENT HELPERS
+  #============================================================================
+  dev:minimal:
+    desc: "Start minimal local cluster (1 CP + 1 Worker)"
+    cmds:
+      - |
+        echo "Starting minimal cluster..."
+        cd infrastructure/vagrant && MINIMAL=true vagrant up talos-cp-01 talos-worker-01
+      - task: local:gen-config
+      - task: local:apply-config
+      - task: local:bootstrap
+      - task: local:cni
+
+  dev:restart:
+    desc: "Restart local VMs without destroying"
+    dir: infrastructure/vagrant
+    cmds:
+      - vagrant reload
+      - sleep 30
+      - task: validate:talos
